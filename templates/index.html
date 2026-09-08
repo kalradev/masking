@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDF Masking</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <p class="eyebrow">Document privacy</p>
+        <h1>masking</h1>
+      </header>
+
+      <section class="panel">
+        <form id="mask-form">
+          <p class="step-label">1. Choose a format</p>
+          <div class="mode-switch" role="radiogroup" aria-label="Document format">
+            <label class="mode-card">
+              <input type="radio" name="vendor" value="airtel" />
+              <span>
+                <strong>Airtel</strong>
+              </span>
+            </label>
+            <label class="mode-card">
+              <input type="radio" name="vendor" value="beetal" />
+              <span>
+                <strong>Beetal</strong>
+              </span>
+            </label>
+          </div>
+
+          <div id="method-step" class="hidden">
+            <p class="step-label">2. Choose a masking method</p>
+            <p class="format-hint" id="format-hint"></p>
+            <div class="mode-switch" role="radiogroup" aria-label="Masking mode">
+              <label class="mode-card">
+                <input type="radio" name="mode" value="auto" />
+                <span>
+                  <strong>Auto detect</strong>
+                </span>
+              </label>
+              <label class="mode-card">
+                <input type="radio" name="mode" value="select" />
+                <span>
+                  <strong>Select on preview</strong>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <div class="dropzone-wrap hidden" id="upload-step">
+            <p class="step-label">3. Upload PDF files</p>
+            <label class="dropzone" id="dropzone">
+              <input type="file" id="file" name="files" accept=".pdf,application/pdf" multiple hidden />
+              <strong>Drop PDFs here</strong>
+              <span>or click to choose one or more files</span>
+              <em id="file-name">No file selected</em>
+            </label>
+            <button type="button" id="clear-pdf" class="clear-pdf hidden">Clear PDFs</button>
+          </div>
+
+          <button type="submit" id="submit-btn" class="hidden">Mask PDF</button>
+          <p class="status" id="status"></p>
+        </form>
+      </section>
+
+      <section class="result hidden" id="select-preview">
+        <div class="result-bar">
+          <div>
+            <h2>Select areas to mask</h2>
+            <p>Click and drag to mask. Changes apply automatically. Use Undo / Redo if needed.</p>
+          </div>
+          <div class="actions">
+            <button type="button" id="undo-box" disabled>Undo</button>
+            <button type="button" id="redo-box" disabled>Redo</button>
+            <button type="button" id="clear-boxes">Clear boxes</button>
+            <a class="download" id="select-download" href="#" download="masked.pdf">Download</a>
+          </div>
+        </div>
+        <div id="pages"></div>
+      </section>
+
+      <section class="result hidden" id="result">
+        <div class="result-bar">
+          <div>
+            <h2>Masked PDF</h2>
+            <p id="stats"></p>
+          </div>
+          <div class="actions">
+            <a class="download hidden" id="download-all" href="#" download="masked_pdfs.zip">Download all</a>
+            <a class="download" id="download-link" href="#" download="masked.pdf">Download</a>
+          </div>
+        </div>
+        <ul class="file-results hidden" id="file-results"></ul>
+        <iframe id="preview" title="Masked PDF preview"></iframe>
+      </section>
+    </main>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
