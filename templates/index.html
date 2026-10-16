@@ -3,100 +3,169 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PDF Masking</title>
+    <title>Document Tools</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
   <body>
-    <main class="app">
-      <header class="hero">
-        <p class="eyebrow">Document privacy</p>
-        <h1>masking</h1>
-      </header>
+    <div class="shell">
+      <aside class="sidebar" aria-label="Main navigation">
+        <div class="sidebar-brand">
+          <p class="eyebrow">Document tools</p>
+        </div>
+        <nav class="sidebar-nav">
+          <button type="button" class="nav-btn active" data-page="masking">Masking</button>
+          <button type="button" class="nav-btn" data-page="convert">Convert</button>
+        </nav>
+      </aside>
 
-      <section class="panel">
-        <form id="mask-form">
-          <p class="step-label">1. Choose a format</p>
-          <div class="mode-switch" role="radiogroup" aria-label="Document format">
-            <label class="mode-card">
-              <input type="radio" name="vendor" value="airtel" />
-              <span>
-                <strong>Airtel</strong>
-              </span>
-            </label>
-            <label class="mode-card">
-              <input type="radio" name="vendor" value="beetal" />
-              <span>
-                <strong>Beetal</strong>
-              </span>
-            </label>
-          </div>
+      <main class="app">
+        <div id="page-masking" class="page">
+          <header class="hero">
+            <p class="eyebrow">Document privacy</p>
+            <h1>Masking</h1>
+          </header>
 
-          <div id="method-step" class="hidden">
-            <p class="step-label">2. Choose a masking method</p>
-            <p class="format-hint" id="format-hint"></p>
-            <div class="mode-switch" role="radiogroup" aria-label="Masking mode">
-              <label class="mode-card">
-                <input type="radio" name="mode" value="auto" />
-                <span>
-                  <strong>Auto detect</strong>
-                </span>
-              </label>
-              <label class="mode-card">
-                <input type="radio" name="mode" value="select" />
-                <span>
-                  <strong>Select on preview</strong>
-                </span>
-              </label>
+          <section class="panel">
+            <form id="mask-form">
+              <p class="step-label">1. Choose a format</p>
+              <div class="mode-switch" role="radiogroup" aria-label="Document format">
+                <label class="mode-card">
+                  <input type="radio" name="vendor" value="airtel" />
+                  <span>
+                    <strong>Airtel</strong>
+                  </span>
+                </label>
+                <label class="mode-card">
+                  <input type="radio" name="vendor" value="beetal" />
+                  <span>
+                    <strong>Beetal</strong>
+                  </span>
+                </label>
+              </div>
+
+              <div id="method-step" class="hidden">
+                <p class="step-label">2. Choose a masking method</p>
+                <p class="format-hint" id="format-hint"></p>
+                <div class="mode-switch" role="radiogroup" aria-label="Masking mode">
+                  <label class="mode-card">
+                    <input type="radio" name="mode" value="auto" />
+                    <span>
+                      <strong>Auto detect</strong>
+                    </span>
+                  </label>
+                  <label class="mode-card">
+                    <input type="radio" name="mode" value="select" />
+                    <span>
+                      <strong>Select on preview</strong>
+                    </span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="dropzone-wrap hidden" id="upload-step">
+                <p class="step-label">3. Upload PDF files</p>
+                <label class="dropzone" id="dropzone">
+                  <input type="file" id="file" name="files" accept=".pdf,application/pdf" multiple hidden />
+                  <strong>Drop PDFs here</strong>
+                  <span>or click to choose one or more files</span>
+                  <em id="file-name">No file selected</em>
+                </label>
+                <button type="button" id="clear-pdf" class="clear-pdf hidden">Clear PDFs</button>
+              </div>
+
+              <button type="submit" id="submit-btn" class="hidden">Mask PDF</button>
+              <p class="status" id="status"></p>
+            </form>
+          </section>
+
+          <section class="result hidden" id="select-preview">
+            <div class="result-bar">
+              <div>
+                <h2>Select areas to mask</h2>
+                <p>Click and drag to mask. Changes apply automatically. Use Undo / Redo if needed.</p>
+              </div>
+              <div class="actions">
+                <button type="button" id="undo-box" disabled>Undo</button>
+                <button type="button" id="redo-box" disabled>Redo</button>
+                <button type="button" id="clear-boxes">Clear boxes</button>
+                <a class="download" id="select-download" href="#" download="masked.pdf">Download</a>
+              </div>
             </div>
-          </div>
+            <div id="pages"></div>
+          </section>
 
-          <div class="dropzone-wrap hidden" id="upload-step">
-            <p class="step-label">3. Upload PDF files</p>
-            <label class="dropzone" id="dropzone">
-              <input type="file" id="file" name="files" accept=".pdf,application/pdf" multiple hidden />
-              <strong>Drop PDFs here</strong>
-              <span>or click to choose one or more files</span>
-              <em id="file-name">No file selected</em>
-            </label>
-            <button type="button" id="clear-pdf" class="clear-pdf hidden">Clear PDFs</button>
-          </div>
-
-          <button type="submit" id="submit-btn" class="hidden">Mask PDF</button>
-          <p class="status" id="status"></p>
-        </form>
-      </section>
-
-      <section class="result hidden" id="select-preview">
-        <div class="result-bar">
-          <div>
-            <h2>Select areas to mask</h2>
-            <p>Click and drag to mask. Changes apply automatically. Use Undo / Redo if needed.</p>
-          </div>
-          <div class="actions">
-            <button type="button" id="undo-box" disabled>Undo</button>
-            <button type="button" id="redo-box" disabled>Redo</button>
-            <button type="button" id="clear-boxes">Clear boxes</button>
-            <a class="download" id="select-download" href="#" download="masked.pdf">Download</a>
-          </div>
+          <section class="result hidden" id="result">
+            <div class="result-bar">
+              <div>
+                <h2>Masked PDF</h2>
+                <p id="stats"></p>
+              </div>
+              <div class="actions">
+                <a class="download hidden" id="download-all" href="#" download="masked_pdfs.zip">Download all</a>
+                <a class="download" id="download-link" href="#" download="masked.pdf">Download</a>
+              </div>
+            </div>
+            <ul class="file-results hidden" id="file-results"></ul>
+            <iframe id="preview" title="Masked PDF preview"></iframe>
+          </section>
         </div>
-        <div id="pages"></div>
-      </section>
 
-      <section class="result hidden" id="result">
-        <div class="result-bar">
-          <div>
-            <h2>Masked PDF</h2>
-            <p id="stats"></p>
-          </div>
-          <div class="actions">
-            <a class="download hidden" id="download-all" href="#" download="masked_pdfs.zip">Download all</a>
-            <a class="download" id="download-link" href="#" download="masked.pdf">Download</a>
-          </div>
+        <div id="page-convert" class="page hidden">
+          <header class="hero">
+            <p class="eyebrow">File conversion</p>
+            <h1>Convert</h1>
+          </header>
+
+          <section class="panel">
+            <form id="convert-form">
+              <p class="step-label">1. Choose conversion</p>
+              <div class="mode-switch" role="radiogroup" aria-label="Conversion direction">
+                <label class="mode-card">
+                  <input type="radio" name="convert-dir" value="pdf-to-word" />
+                  <span>
+                    <strong>PDF → Word</strong>
+                  </span>
+                </label>
+                <label class="mode-card">
+                  <input type="radio" name="convert-dir" value="word-to-pdf" />
+                  <span>
+                    <strong>Word → PDF</strong>
+                  </span>
+                </label>
+              </div>
+              <p class="format-hint" id="convert-hint"></p>
+
+              <div class="dropzone-wrap hidden" id="convert-upload-step">
+                <p class="step-label">2. Upload files</p>
+                <label class="dropzone" id="convert-dropzone">
+                  <input type="file" id="convert-file" name="files" multiple hidden />
+                  <strong id="convert-drop-title">Drop files here</strong>
+                  <span id="convert-drop-hint">or click to choose one or more files</span>
+                  <em id="convert-file-name">No file selected</em>
+                </label>
+                <button type="button" id="convert-clear" class="clear-pdf hidden">Clear files</button>
+              </div>
+
+              <button type="submit" id="convert-btn" class="hidden">Convert</button>
+              <p class="status" id="convert-status"></p>
+            </form>
+          </section>
+
+          <section class="result hidden" id="convert-result">
+            <div class="result-bar">
+              <div>
+                <h2>Converted files</h2>
+                <p id="convert-stats"></p>
+              </div>
+              <div class="actions">
+                <a class="download hidden" id="convert-download-all" href="#" download="converted.zip">Download all</a>
+              </div>
+            </div>
+            <ul class="file-results" id="convert-file-results"></ul>
+          </section>
         </div>
-        <ul class="file-results hidden" id="file-results"></ul>
-        <iframe id="preview" title="Masked PDF preview"></iframe>
-      </section>
-    </main>
+      </main>
+    </div>
     <script src="{{ url_for('static', filename='app.js') }}"></script>
   </body>
 </html>

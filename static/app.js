@@ -20,12 +20,37 @@ const clearPdf = document.getElementById("clear-pdf");
 const uploadStep = document.getElementById("upload-step");
 const methodStep = document.getElementById("method-step");
 const formatHint = document.getElementById("format-hint");
+const pageMasking = document.getElementById("page-masking");
+const pageConvert = document.getElementById("page-convert");
+const convertForm = document.getElementById("convert-form");
+const convertFileInput = document.getElementById("convert-file");
+const convertDropzone = document.getElementById("convert-dropzone");
+const convertFileName = document.getElementById("convert-file-name");
+const convertUploadStep = document.getElementById("convert-upload-step");
+const convertBtn = document.getElementById("convert-btn");
+const convertClear = document.getElementById("convert-clear");
+const convertStatus = document.getElementById("convert-status");
+const convertResult = document.getElementById("convert-result");
+const convertStats = document.getElementById("convert-stats");
+const convertDownloadAll = document.getElementById("convert-download-all");
+const convertFileResults = document.getElementById("convert-file-results");
+const convertDropTitle = document.getElementById("convert-drop-title");
+const convertDropHint = document.getElementById("convert-drop-hint");
+const convertHint = document.getElementById("convert-hint");
+
+let convertFiles = [];
 
 const FORMAT_HINTS = {
   airtel:
     "Airtel auto detect masks: total purchase order value, value in words, unit price, line total, CGST, SGST, total line value, and payment terms. (INR) stays visible.",
   beetal:
     "Beetal auto detect masks: unit price, delivery date, amount, rate, total amount, total value with GST, PO value in words, and payment terms.",
+};
+
+const CONVERT_HINTS = {
+  "pdf-to-word":
+    "PDF → Word creates an editable Word file. Amount / price columns are cleaned so digits stay on one line.",
+  "word-to-pdf": "Word → PDF converts your document to PDF.",
 };
 
 const MAX_FILES = 25;
@@ -65,6 +90,25 @@ function syncMode() {
     submitBtn.textContent = "Mask PDF";
   }
 }
+
+function showPage(page) {
+  const isMasking = page === "masking";
+  pageMasking.classList.toggle("hidden", !isMasking);
+  pageConvert.classList.toggle("hidden", isMasking);
+  document.querySelectorAll(".nav-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.page === page);
+  });
+  if (isMasking) {
+    clearConvertFiles();
+    convertResult.classList.add("hidden");
+  } else {
+    clearSelectedPdf();
+  }
+}
+
+document.querySelectorAll(".nav-btn").forEach((btn) => {
+  btn.addEventListener("click", () => showPage(btn.dataset.page));
+});
 
 form.querySelectorAll('input[name="vendor"]').forEach((input) => {
   input.addEventListener("change", () => {
@@ -549,5 +593,195 @@ form.addEventListener("submit", async (event) => {
     statusEl.textContent = error.message;
   } finally {
     submitBtn.disabled = false;
+  }
+});
+
+function currentConvertDir() {
+  return convertForm.querySelector('input[name="convert-dir"]:checked')?.value || null;
+}
+
+function syncConvert() {
+  const dir = currentConvertDir();
+  convertUploadStep.classList.toggle("hidden", !dir);
+  convertBtn.classList.toggle("hidden", !dir);
+  if (convertHint) {
+    convertHint.textContent = dir ? CONVERT_HINTS[dir] || "" : "";
+  }
+  if (dir === "pdf-to-word") {
+    convertFileInput.accept = ".pdf,application/pdf";
+    convertDropTitle.textContent = "Drop PDFs here";
+    convertDropHint.textContent = "or click to choose one or more PDF files";
+    convertBtn.textContent =
+      convertFiles.length > 1 ? `Convert ${convertFiles.length} PDFs` : "Convert to Word";
+  } else if (dir === "word-to-pdf") {
+    convertFileInput.accept =
+      ".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    convertDropTitle.textContent = "Drop Word files here";
+    convertDropHint.textContent = "or click to choose one or more Word files";
+    convertBtn.textContent =
+      convertFiles.length > 1 ? `Convert ${convertFiles.length} files` : "Convert to PDF";
+  }
+}
+
+function setConvertFiles(files) {
+  convertFiles = files;
+  const transfer = new DataTransfer();
+  convertFiles.forEach((file) => transfer.items.add(file));
+  convertFileInput.files = transfer.files;
+  if (!convertFiles.length) {
+    convertFileName.textContent = "No file selected";
+  } else if (convertFiles.length === 1) {
+    convertFileName.textContent = convertFiles[0].name;
+  } else {
+    convertFileName.textContent = `${convertFiles.length} files selected`;
+  }
+  convertClear.classList.toggle("hidden", !convertFiles.length);
+  syncConvert();
+}
+
+function clearConvertFiles() {
+  convertFiles = [];
+  convertFileInput.value = "";
+  setConvertFiles([]);
+  convertStatus.textContent = "";
+  convertResult.classList.add("hidden");
+  convertDownloadAll.classList.add("hidden");
+  convertDownloadAll.href = "#";
+  convertFileResults.innerHTML = "";
+  convertStats.textContent = "";
+}
+
+function isPdfFile(file) {
+  return Boolean(
+    file && (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"))
+  );
+}
+
+function isWordFile(file) {
+  const name = (file?.name || "").toLowerCase();
+  return Boolean(
+    file &&
+      (name.endsWith(".docx") ||
+        name.endsWith(".doc") ||
+        file.type === "application/msword" ||
+        file.type ===
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+  );
+}
+
+function takeConvertFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) {
+    setConvertFiles([]);
+    return;
+  }
+  const dir = currentConvertDir();
+  const filtered =
+    dir === "word-to-pdf" ? files.filter(isWordFile) : files.filter(isPdfFile);
+  if (!filtered.length) {
+    convertFileInput.value = "";
+    setConvertFiles([]);
+    convertStatus.textContent =
+      dir === "word-to-pdf" ? "Only Word files (.doc / .docx) are allowed." : "Only PDF files are allowed.";
+    return;
+  }
+  if (filtered.length > MAX_FILES) {
+    convertFileInput.value = "";
+    setConvertFiles([]);
+    convertStatus.textContent = `Upload up to ${MAX_FILES} files at once.`;
+    return;
+  }
+  setConvertFiles(filtered);
+  convertStatus.textContent = "";
+}
+
+convertForm.querySelectorAll('input[name="convert-dir"]').forEach((input) => {
+  input.addEventListener("change", () => {
+    clearConvertFiles();
+    syncConvert();
+  });
+});
+syncConvert();
+
+convertFileInput.addEventListener("change", () => {
+  takeConvertFiles(convertFileInput.files);
+});
+
+convertClear.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  clearConvertFiles();
+});
+
+["dragenter", "dragover"].forEach((eventName) => {
+  convertDropzone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    convertDropzone.classList.add("dragover");
+  });
+});
+
+["dragleave", "drop"].forEach((eventName) => {
+  convertDropzone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    convertDropzone.classList.remove("dragover");
+  });
+});
+
+convertDropzone.addEventListener("drop", (event) => {
+  takeConvertFiles(event.dataTransfer.files);
+});
+
+function showConvertResult(data) {
+  const files = data.files || [];
+  convertFileResults.innerHTML = files
+    .map(
+      (item) =>
+        `<li><span>${item.original_name} → ${item.output_name}</span><a href="${item.download_url}" download>Download</a></li>`
+    )
+    .join("");
+  if (data.zip_url && files.length > 1) {
+    convertDownloadAll.href = data.zip_url;
+    convertDownloadAll.classList.remove("hidden");
+  } else {
+    convertDownloadAll.classList.add("hidden");
+  }
+  convertStats.textContent = `Converted ${files.length} file${files.length > 1 ? "s" : ""}.`;
+  convertResult.classList.remove("hidden");
+  convertStatus.textContent = files.length > 1 ? "Done. Download all below." : "Done.";
+}
+
+convertForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!currentConvertDir()) {
+    convertStatus.textContent = "Choose PDF → Word or Word → PDF first.";
+    return;
+  }
+  if (!convertFiles.length) {
+    convertStatus.textContent = "Choose files first.";
+    return;
+  }
+
+  convertBtn.disabled = true;
+  convertResult.classList.add("hidden");
+  convertStatus.textContent =
+    convertFiles.length > 1 ? `Converting ${convertFiles.length} files...` : "Converting...";
+
+  try {
+    const body = new FormData();
+    body.append("direction", currentConvertDir());
+    convertFiles.forEach((file) => body.append("files", file));
+    const response = await fetch("/api/convert", {
+      method: "POST",
+      body,
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || "Conversion failed.");
+    }
+    showConvertResult(data);
+  } catch (error) {
+    convertStatus.textContent = error.message;
+  } finally {
+    convertBtn.disabled = false;
   }
 });

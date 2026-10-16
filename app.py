@@ -1,10 +1,14 @@
 import re
+import shutil
+import subprocess
 import uuid
 import zipfile
 from pathlib import Path
 
 import pymupdf as fitz
 from flask import Flask, jsonify, render_template, request, send_file
+from pdf2docx import Converter
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150 MB batch
@@ -14,9 +18,13 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "storage" / "uploads"
 OUTPUT_DIR = BASE_DIR / "storage" / "masked"
 PAGES_DIR = BASE_DIR / "storage" / "pages"
+CONVERT_UPLOAD_DIR = BASE_DIR / "storage" / "convert_uploads"
+CONVERT_OUTPUT_DIR = BASE_DIR / "storage" / "converted"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 PAGES_DIR.mkdir(parents=True, exist_ok=True)
+CONVERT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+CONVERT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 PAGE_ZOOM = 2.0
@@ -1533,6 +1541,355 @@ def serve_zip(batch_id: str):
         mimetype="application/zip",
         as_attachment=True,
         download_name="masked_pdfs.zip",
+    )
+
+
+def is_pdf_name(name: str) -> bool:
+    return (name or "").lower().endswith(".pdf")
+
+
+def is_word_name(name: str) -> bool:
+    lower = (name or "").lower()
+    return lower.endswith(".docx") or lower.endswith(".doc")
+
+
+def convert_stem(original: str) -> str:
+    stem = Path(original or "document").stem
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "document"
+    return cleaned[:80]
+
+
+def find_soffice() -> str | None:
+    which = shutil.which("soffice") or shutil.which("soffice.exe")
+    if which:
+        return which
+    candidates = [
+        Path(r"C:\Program Files\LibreOffice\program\soffice.exe"),
+        Path(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return None
+
+
+AMOUNT_CELL_RE = re.compile(
+    r"^[\d,]+(?:\.\d{1,3})?$|^[\d,]+\.$|^\.\d{1,3}$|^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}$"
+)
+AMOUNT_HEADER_RE = re.compile(
+    r"(?i)\b(unit\s*price|amount|total(?:\s*amount)?|rate|price|value)\b"
+)
+
+
+def _cell_plain_text(cell) -> str:
+    parts = []
+    for paragraph in cell.paragraphs:
+        parts.append("".join(run.text or "" for run in paragraph.runs) or (paragraph.text or ""))
+    return "".join(parts).strip()
+
+
+def _looks_like_amount_fragment(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return False
+    if AMOUNT_CELL_RE.fullmatch(compact):
+        return True
+    # Broken cells often store one digit / comma / decimal per paragraph.
+    joined = "".join(compact.split())
+    return bool(re.fullmatch(r"[\d,.]+", joined) and re.search(r"\d", joined) and len(joined) <= 24)
+
+
+def _set_cell_nowrap(cell) -> None:
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    tc = cell._tc
+    tc_pr = tc.get_or_add_tcPr()
+    no_wrap = tc_pr.find(qn("w:noWrap"))
+    if no_wrap is None:
+        no_wrap = OxmlElement("w:noWrap")
+        tc_pr.append(no_wrap)
+
+
+def _rewrite_cell_single_line(cell, text: str) -> None:
+    """Replace broken multi-line cell content with one readable amount line."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
+
+    first = cell.paragraphs[0]
+    for paragraph in list(cell.paragraphs[1:]):
+        element = paragraph._element
+        element.getparent().remove(element)
+
+    for run in list(first.runs):
+        run._element.getparent().remove(run._element)
+    first.text = ""
+    run = first.add_run(text)
+    run.font.size = Pt(8)
+    first.paragraph_format.space_before = Pt(0)
+    first.paragraph_format.space_after = Pt(0)
+    first.paragraph_format.line_spacing = 1.0
+
+    p_pr = first._p.get_or_add_pPr()
+    word_wrap = p_pr.find(qn("w:wordWrap"))
+    if word_wrap is None:
+        word_wrap = OxmlElement("w:wordWrap")
+        p_pr.append(word_wrap)
+    word_wrap.set(qn("w:val"), "0")
+    _set_cell_nowrap(cell)
+
+    tc = cell._tc
+    tc_pr = tc.get_or_add_tcPr()
+    tc_w = tc_pr.find(qn("w:tcW"))
+    needed = max(1400, min(3200, 150 * max(len(text), 6)))  # twips
+    if tc_w is None:
+        tc_w = OxmlElement("w:tcW")
+        tc_pr.append(tc_w)
+    try:
+        current = int(tc_w.get(qn("w:w")) or "0")
+    except Exception:
+        current = 0
+    if current < needed:
+        tc_w.set(qn("w:w"), str(needed))
+        tc_w.set(qn("w:type"), "dxa")
+
+
+def fix_docx_collapsed_amounts(docx_path: Path) -> None:
+    """Repair amount/price cells that pdf2docx wrapped into vertical digit stacks."""
+    from docx import Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    document = Document(str(docx_path))
+    for table in document.tables:
+        table.autofit = True
+        table.allow_autofit = True
+        tbl = table._tbl
+        tbl_pr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
+        if tbl.tblPr is None:
+            tbl.insert(0, tbl_pr)
+        layout = tbl_pr.find(qn("w:tblLayout"))
+        if layout is None:
+            layout = OxmlElement("w:tblLayout")
+            tbl_pr.append(layout)
+        layout.set(qn("w:type"), "autofit")
+
+        header_amount_cols: set[int] = set()
+        if table.rows:
+            for idx, cell in enumerate(table.rows[0].cells):
+                if AMOUNT_HEADER_RE.search(cell.text or ""):
+                    header_amount_cols.add(idx)
+
+        for row in table.rows:
+            for col_idx, cell in enumerate(row.cells):
+                raw_paragraphs = [(p.text or "").strip() for p in cell.paragraphs]
+                compact = re.sub(r"\s+", "", "".join(raw_paragraphs))
+                non_empty = [part for part in raw_paragraphs if part]
+                many_tiny_lines = len(non_empty) >= 2 and all(len(part) <= 4 for part in non_empty)
+                is_amount_col = col_idx in header_amount_cols
+                if not (
+                    is_amount_col
+                    or _looks_like_amount_fragment(compact)
+                    or (many_tiny_lines and re.fullmatch(r"[\d,.]+", compact or ""))
+                ):
+                    continue
+                if not compact or not re.search(r"\d", compact):
+                    continue
+                _rewrite_cell_single_line(cell, compact)
+
+    document.save(str(docx_path))
+
+
+def pdf_to_word(source: Path, dest: Path) -> None:
+    """Convert PDF to editable Word, then fix crushed amount columns."""
+    converter = Converter(str(source))
+    try:
+        converter.convert(
+            str(dest),
+            parse_lattice_table=True,
+            parse_stream_table=True,
+            extract_stream_table=False,
+            min_section_height=8.0,
+            page_margin_factor_top=1.0,
+            page_margin_factor_bottom=1.0,
+            connected_border_tolerance=1.5,
+            max_border_width=10.0,
+            min_border_clearance=1.0,
+            clip_image_res_ratio=5.0,
+            float_image_ignorable_gap=2.0,
+            line_separate_threshold=2.5,
+            line_break_width_ratio=0.25,
+            line_break_free_space_ratio=0.05,
+            new_paragraph_free_space_ratio=0.95,
+            lines_left_aligned_threshold=1.5,
+            lines_right_aligned_threshold=1.5,
+            delete_end_line_hyphen=False,
+            ignore_page_error=True,
+        )
+    finally:
+        converter.close()
+    if not dest.exists() or dest.stat().st_size == 0:
+        raise RuntimeError("PDF → Word conversion produced an empty file.")
+    try:
+        fix_docx_collapsed_amounts(dest)
+    except Exception:
+        # Conversion succeeded even if cleanup fails; keep the editable Word file.
+        pass
+
+
+def word_to_pdf(source: Path, dest: Path) -> None:
+    try:
+        from docx2pdf import convert as docx_convert
+
+        docx_convert(str(source), str(dest))
+        if dest.exists():
+            return
+    except Exception:
+        pass
+
+    soffice = find_soffice()
+    if not soffice:
+        raise RuntimeError(
+            "Word → PDF needs Microsoft Word (docx2pdf) or LibreOffice installed on this PC."
+        )
+
+    out_dir = dest.parent
+    result = subprocess.run(
+        [
+            soffice,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(out_dir),
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    produced = out_dir / f"{source.stem}.pdf"
+    if result.returncode != 0 or not produced.exists():
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(detail or "LibreOffice could not convert this Word file.")
+    if produced != dest:
+        produced.replace(dest)
+
+
+@app.post("/api/convert")
+def api_convert():
+    direction = (request.form.get("direction") or "").strip().lower()
+    if direction not in {"pdf-to-word", "word-to-pdf"}:
+        return jsonify({"error": "Choose PDF → Word or Word → PDF."}), 400
+
+    uploads = request.files.getlist("files") or request.files.getlist("file")
+    uploads = [item for item in uploads if item and item.filename]
+    if not uploads:
+        return jsonify({"error": "Please upload at least one file."}), 400
+    if len(uploads) > MAX_FILES:
+        return jsonify({"error": f"Upload up to {MAX_FILES} files at once."}), 400
+
+    batch_id = uuid.uuid4().hex
+    results = []
+    zip_path = CONVERT_OUTPUT_DIR / f"{batch_id}.zip"
+
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            used_names = set()
+            for uploaded in uploads:
+                original = uploaded.filename or "document"
+                if direction == "pdf-to-word" and not is_pdf_name(original):
+                    return jsonify({"error": f"{original} is not a PDF."}), 400
+                if direction == "word-to-pdf" and not is_word_name(original):
+                    return jsonify({"error": f"{original} is not a Word file."}), 400
+
+                job_id = uuid.uuid4().hex
+                suffix = Path(original).suffix.lower() or (
+                    ".pdf" if direction == "pdf-to-word" else ".docx"
+                )
+                source_path = CONVERT_UPLOAD_DIR / f"{job_id}{suffix}"
+                uploaded.save(source_path)
+
+                if direction == "pdf-to-word":
+                    output_name = f"{convert_stem(original)}.docx"
+                    dest_path = CONVERT_OUTPUT_DIR / f"{job_id}.docx"
+                    pdf_to_word(source_path, dest_path)
+                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                else:
+                    output_name = f"{convert_stem(original)}.pdf"
+                    dest_path = CONVERT_OUTPUT_DIR / f"{job_id}.pdf"
+                    word_to_pdf(source_path, dest_path)
+                    mime = "application/pdf"
+
+                if output_name in used_names:
+                    output_name = f"{job_id[:8]}_{output_name}"
+                used_names.add(output_name)
+                archive.write(dest_path, arcname=output_name)
+                results.append(
+                    {
+                        "job_id": job_id,
+                        "original_name": original,
+                        "output_name": output_name,
+                        "download_url": f"/download-converted/{job_id}?name={secure_filename(output_name)}",
+                        "mime": mime,
+                    }
+                )
+    except Exception as exc:
+        return jsonify({"error": f"Could not convert these files: {exc}"}), 500
+
+    payload = {
+        "batch_id": batch_id,
+        "direction": direction,
+        "files": results,
+    }
+    if len(results) > 1:
+        payload["zip_url"] = f"/download-converted-zip/{batch_id}"
+    return jsonify(payload)
+
+
+@app.get("/download-converted/<job_id>")
+def serve_converted(job_id: str):
+    if not is_job_id(job_id):
+        return jsonify({"error": "Invalid file id."}), 400
+
+    docx_path = CONVERT_OUTPUT_DIR / f"{job_id}.docx"
+    pdf_path = CONVERT_OUTPUT_DIR / f"{job_id}.pdf"
+    if docx_path.exists():
+        dest_path = docx_path
+        default_name = "converted.docx"
+        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif pdf_path.exists():
+        dest_path = pdf_path
+        default_name = "converted.pdf"
+        mime = "application/pdf"
+    else:
+        return jsonify({"error": "Converted file not found. Please convert again."}), 404
+
+    name = request.args.get("name") or default_name
+    return send_file(
+        dest_path,
+        mimetype=mime,
+        as_attachment=True,
+        download_name=name,
+    )
+
+
+@app.get("/download-converted-zip/<batch_id>")
+def serve_converted_zip(batch_id: str):
+    if not is_job_id(batch_id):
+        return jsonify({"error": "Invalid file id."}), 400
+    zip_path = CONVERT_OUTPUT_DIR / f"{batch_id}.zip"
+    if not zip_path.exists():
+        return jsonify({"error": "Zip file not found. Please convert again."}), 404
+    return send_file(
+        zip_path,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="converted.zip",
     )
 
 
