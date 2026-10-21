@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import uuid
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 
 import pymupdf as fitz
@@ -337,7 +338,12 @@ def redact_with_stars(page, items: list[tuple], fill_stars: bool = True) -> int:
 
 
 def merge_star_hits(items: list[tuple]) -> list[tuple]:
-    """One star group per cell: drop duplicate ***** on wrapped decimals."""
+    """Drop duplicate ***** for the same token (label + column hits).
+
+    Only near-identical rects are merged. Different rows that happen to be
+    close (IGST row and Total Line Value row) each keep their own stars.
+    Wrapped fragments are grouped by the caller, not here.
+    """
     stars = [(fitz.Rect(rect), payload) for rect, payload in items if payload]
     extras = [(fitz.Rect(rect), "") for rect, payload in items if not payload]
     kept = []
@@ -345,19 +351,15 @@ def merge_star_hits(items: list[tuple]) -> list[tuple]:
     for i, (rect_a, payload_a) in enumerate(stars):
         if i in used:
             continue
-        star_rect = rect_a
         for j, (rect_b, _payload_b) in enumerate(stars):
             if j <= i or j in used:
                 continue
             close_x = rect_a.x0 < rect_b.x1 + 4 and rect_a.x1 > rect_b.x0 - 4
-            close_y = abs(rect_a.y0 - rect_b.y0) < 22 or abs(rect_a.y1 - rect_b.y0) < 14
-            if close_x and close_y:
+            same_line = abs(rect_a.y0 - rect_b.y0) < 3 and abs(rect_a.y1 - rect_b.y1) < 4
+            if close_x and same_line:
                 extras.append((rect_b, ""))
                 used.add(j)
-                if rect_b.y0 < star_rect.y0:
-                    extras.append((star_rect, ""))
-                    star_rect = rect_b
-        kept.append((star_rect, payload_a))
+        kept.append((rect_a, payload_a))
         used.add(i)
     return kept + extras
 
@@ -374,22 +376,32 @@ def tight_redact_rect(rect: fitz.Rect) -> fitz.Rect:
 
 
 def clip_rect_from_neighbors(page, rect: fitz.Rect) -> fitz.Rect:
-    """Keep the redact box on this line; do not drop down onto wrapped decimals only."""
-    band = tight_redact_rect(rect)
+    """Shrink the redact box so it only touches this line's glyphs.
+
+    Word boxes of adjacent lines overlap by a couple of points, and MuPDF
+    removes any character whose box intersects a redaction. So the band
+    must start below the previous line's box and end above the next one.
+    """
+    center_y = (rect.y0 + rect.y1) / 2
+    y0 = rect.y0 + 0.4
+    y1 = rect.y1 - 0.4
     for word in page.get_text("words"):
         neighbor = fitz.Rect(word[:4])
-        if neighbor.is_empty or neighbor.x1 <= band.x0 or neighbor.x0 >= band.x1:
+        if neighbor.is_empty or neighbor.x1 <= rect.x0 or neighbor.x0 >= rect.x1:
             continue
-        neighbor_mid = (neighbor.y0 + neighbor.y1) / 2
-        if neighbor_mid > band.y1 + 1.0 and neighbor.y0 < band.y1 + 8:
-            continue
-        if neighbor.y0 >= band.y1 - 0.2:
-            band.y1 = min(band.y1, neighbor.y0 - 0.35)
-        elif neighbor.y1 <= band.y0 + 0.2:
-            band.y0 = max(band.y0, neighbor.y1 + 0.35)
-    if band.y1 - band.y0 < 3.5:
-        band = tight_redact_rect(rect)
-    return band
+        neighbor_center = (neighbor.y0 + neighbor.y1) / 2
+        if abs(neighbor_center - center_y) <= 3.0:
+            continue  # same line (includes the target words themselves)
+        if neighbor_center < center_y:
+            if neighbor.y1 > y0:
+                y0 = max(y0, neighbor.y1 + 0.25)
+        else:
+            if neighbor.y0 < y1:
+                y1 = min(y1, neighbor.y0 - 0.25)
+    if y1 - y0 < 1.2:
+        y0 = center_y - 0.6
+        y1 = center_y + 0.6
+    return fitz.Rect(rect.x0 + 0.15, y0, rect.x1 - 0.1, y1)
 
 
 def star_baseline(rect: fitz.Rect, fontsize: float) -> float:
@@ -606,7 +618,7 @@ def find_table_amount_rects(page) -> list[tuple[fitz.Rect, str]]:
     return unique
 
 
-MONEY_TOKEN = re.compile(r"^[\d,]+(?:\.\d{1,2})?$")
+MONEY_TOKEN = re.compile(r"^[\d,]+(?:\.\d*)?$")
 INR_TOKEN = re.compile(r"^\(?INR\)?\.?$|^₹$", re.I)
 GST_LABEL = re.compile(r"(?i)^(cgst|sgst|igst)(_|\d|$)")
 AMOUNT_WORD_TOKEN = re.compile(
@@ -920,16 +932,14 @@ def airtel_header_kind(parts: list[str]) -> str | None:
     return None
 
 
-def find_airtel_column_rects(page) -> list[tuple[fitz.Rect, str]]:
-    items = page_word_items(page)
-    if not items:
-        return []
-    hits = []
-    for row in group_word_rows(items):
+def detect_airtel_columns(items: list[dict]):
+    """Find Unit Price / Line Total columns from a header row on this page."""
+    for row in group_word_rows(items, tol=12):
         joined = " ".join(word["text"] for word in row).lower()
         if "unit" not in joined or "price" not in joined or "line" not in joined or "total" not in joined:
             continue
         columns = []
+        header_word_bottoms = []
         index = 0
         while index < len(row):
             one = [row[index]["text"]]
@@ -941,6 +951,9 @@ def find_airtel_column_rects(page) -> list[tuple[fitz.Rect, str]]:
                 span = 1
             if kind:
                 columns.append([row[index]["x0"], row[index + span - 1]["x1"], kind])
+                header_word_bottoms.extend(
+                    row[j]["y1"] for j in range(index, index + span)
+                )
                 index += span
             else:
                 index += 1
@@ -951,26 +964,102 @@ def find_airtel_column_rects(page) -> list[tuple[fitz.Rect, str]]:
             next_left = columns[i + 1][0] if i + 1 < len(columns) else None
             col_right = ((right + next_left) / 2) if next_left is not None else right + 90
             sized.append((left - 8, col_right, kind))
-        header_bottom = max(word["y1"] for word in row)
-        footer_cut = page.rect.y0 + float(page.rect.height) * 0.86
-        for word in items:
-            if word["y0"] < header_bottom - 1:
-                continue
-            if word["y0"] > footer_cut:
-                continue
-            if not is_money_token(word["text"]):
-                continue
-            digits = re.sub(r"\D", "", word["text"])
-            if len(digits) < 4:
-                continue
-            if is_protected_airtel_text(items, word, page):
-                continue
-            center_x = (word["x0"] + word["x1"]) / 2
+        # Only the Unit Price / Line Total words set the cutoff. Other header
+        # cells wrap onto a second line (e.g. "End Date") and would otherwise
+        # push the cutoff into the first data row.
+        header_bottom = max(header_word_bottoms) if header_word_bottoms else max(
+            word["y1"] for word in row
+        )
+        return sized, header_bottom
+    return None
+
+
+def page_has_airtel_table_signal(items: list[dict]) -> bool:
+    """Continuation pages have no header, but do have IGST / Total Line Value rows."""
+    for row in group_word_rows(items):
+        if any(GST_LABEL.match(word["text"].replace(" ", "")) for word in row):
+            return True
+        norms = [norm_token(word["text"]) for word in row]
+        if norms[:3] == ["total", "line", "value"] or "totallinevalue" in "".join(norms):
+            return True
+    return False
+
+
+def find_airtel_column_rects(page, carry_columns=None):
+    """Mask Unit Price / Line Total cells. Returns (hits, columns for next pages).
+
+    Airtel continuation sheets (page 2+) do not repeat the table header, so
+    columns found on an earlier page are carried forward to those pages.
+    """
+    items = page_word_items(page)
+    if not items:
+        return [], carry_columns
+    detected = detect_airtel_columns(items)
+    if detected:
+        sized, header_bottom = detected
+        active_columns = sized
+    elif carry_columns and page_has_airtel_table_signal(items):
+        sized = carry_columns
+        active_columns = carry_columns
+        header_bottom = float(page.rect.y0)
+    else:
+        return [], carry_columns
+
+    hits = []
+    footer_cut = page.rect.y0 + float(page.rect.height) * 0.86
+    found_words = []
+    for word in items:
+        if word["y0"] < header_bottom - 1:
+            continue
+        if word["y0"] > footer_cut:
+            continue
+        if not is_money_token(word["text"]):
+            continue
+        digits = re.sub(r"\D", "", word["text"])
+        if not digits:
+            continue
+        if is_protected_airtel_text(items, word, page):
+            continue
+        center_x = (word["x0"] + word["x1"]) / 2
+        matched = False
+        for left, right, _kind in sized:
+            if left <= center_x <= right:
+                matched = True
+                break
+        if not matched:
+            # Wide amounts can start before the column centre; accept overlap.
             for left, right, _kind in sized:
-                if left <= center_x <= right:
-                    hits.append((word["rect"], GROUP_STARS))
+                if word["x1"] > left and word["x0"] < right:
+                    matched = True
                     break
-    return hits
+        if matched:
+            found_words.append(word)
+    # Group wrapped continuations (e.g. "322548.4800000" / "0004") so the
+    # full amount gets one ***** on its first line, not a star per fragment.
+    used_ids = set()
+    for word in found_words:
+        if id(word) in used_ids:
+            continue
+        group = [word]
+        for other in found_words:
+            if other is word or id(other) in used_ids:
+                continue
+            dy = other["y0"] - word["y0"]
+            if dy < 4 or dy > 18:
+                continue
+            if not (other["x0"] < word["x1"] and other["x1"] > word["x0"]):
+                continue
+            token = (other["text"] or "").replace(" ", "").strip()
+            is_fragment = bool(
+                re.fullmatch(r"\.\d+", token) or re.fullmatch(r"\d{1,6}", token)
+            )
+            if is_fragment:
+                group.append(other)
+                used_ids.add(id(other))
+                break
+        used_ids.add(id(word))
+        add_star_group(hits, group)
+    return hits, active_columns
 
 
 def unique_rects(items: list[tuple[fitz.Rect, str]]) -> list[tuple[fitz.Rect, str]]:
@@ -984,8 +1073,10 @@ def unique_rects(items: list[tuple[fitz.Rect, str]]) -> list[tuple[fitz.Rect, st
     return unique
 
 
-def find_airtel_rects(page) -> list[tuple[fitz.Rect, str]]:
-    return unique_rects(find_airtel_label_rects(page) + find_airtel_column_rects(page))
+def find_airtel_rects(page, carry_columns=None):
+    column_hits, active_columns = find_airtel_column_rects(page, carry_columns)
+    hits = unique_rects(find_airtel_label_rects(page) + column_hits)
+    return hits, active_columns
 
 
 def find_beetal_rects(page) -> list[tuple[fitz.Rect, str]]:
@@ -1243,10 +1334,11 @@ def mask_pdf(
     found_terms: list[str] = []
     vendor = (vendor or "airtel").lower().strip()
 
+    airtel_carry_columns = None
     for page in doc:
         items = []
         if auto and vendor == "airtel":
-            items = find_airtel_rects(page)
+            items, airtel_carry_columns = find_airtel_rects(page, airtel_carry_columns)
         elif auto and vendor == "beetal":
             items = find_beetal_rects(page)
         else:
@@ -1738,7 +1830,401 @@ def pdf_to_word(source: Path, dest: Path) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Built-in Word (.docx) -> PDF conversion. No Microsoft Word / LibreOffice
+# installation needed: the document is rendered with PyMuPDF.
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=8192)
+def _text_width(token: str, fontname: str, fontsize: float) -> float:
+    try:
+        return fitz.get_text_length(token, fontname=fontname, fontsize=fontsize)
+    except Exception:
+        return len(token) * fontsize * 0.5
+
+
+_DOCX_FONT_MAP = {
+    "courier": ("cour", "cobo", "coit", "cobi"),
+    "consolas": ("cour", "cobo", "coit", "cobi"),
+    "times": ("tiro", "tibo", "tiit", "tibi"),
+    "georgia": ("tiro", "tibo", "tiit", "tibi"),
+    "garamond": ("tiro", "tibo", "tiit", "tibi"),
+}
+
+
+def _docx_font(run, base_size: float) -> tuple[str, float]:
+    name = ""
+    size = base_size
+    try:
+        if run.font.size:
+            size = float(run.font.size.pt)
+        if run.font.name:
+            name = run.font.name.lower()
+        elif run.style is not None and run.style.font.name:
+            name = run.style.font.name.lower()
+    except Exception:
+        pass
+    family = ("helv", "hebo", "heit", "hebi")
+    for key, fonts in _DOCX_FONT_MAP.items():
+        if key in name:
+            family = fonts
+            break
+    bold = bool(run.bold)
+    italic = bool(run.italic)
+    if bold and italic:
+        return family[3], size
+    if bold:
+        return family[1], size
+    if italic:
+        return family[2], size
+    return family[0], size
+
+
+def _docx_color(run) -> tuple[float, float, float]:
+    try:
+        rgb = run.font.color.rgb
+        if rgb is not None:
+            return (rgb[0] / 255, rgb[1] / 255, rgb[2] / 255)
+    except Exception:
+        pass
+    return (0, 0, 0)
+
+
+class _DocxPdfRenderer:
+    def __init__(self, document):
+        self.document = document
+        section = document.sections[0]
+        self.page_w = float(section.page_width.pt)
+        self.page_h = float(section.page_height.pt)
+        self.margin_l = float(section.left_margin.pt) if section.left_margin else 36.0
+        self.margin_r = float(section.right_margin.pt) if section.right_margin else 36.0
+        self.margin_t = float(section.top_margin.pt) if section.top_margin else 36.0
+        self.margin_b = float(section.bottom_margin.pt) if section.bottom_margin else 36.0
+        self.content_w = max(100.0, self.page_w - self.margin_l - self.margin_r)
+        self.base_size = 10.5
+        try:
+            normal = document.styles["Normal"]
+            if normal.font.size:
+                self.base_size = float(normal.font.size.pt)
+        except Exception:
+            pass
+        self.pdf = fitz.open()
+        self.page = None
+        self.y = self.margin_t
+        self.new_page()
+
+    def new_page(self):
+        self.page = self.pdf.new_page(width=self.page_w, height=self.page_h)
+        self.y = self.margin_t
+
+    def ensure_space(self, height: float):
+        if self.y + height > self.page_h - self.margin_b and self.y > self.margin_t:
+            self.new_page()
+
+    def wrap_runs(self, runs, max_width: float):
+        """Split styled runs into lines of (text, fontname, size, color)."""
+        words = []
+        for run in runs:
+            text = run.text or ""
+            if not text:
+                continue
+            fontname, size = _docx_font(run, self.base_size)
+            color = _docx_color(run)
+            for token in re.split(r"(\s+)", text):
+                if token:
+                    words.append((token, fontname, size, color))
+        lines = []
+        current = []
+        current_w = 0.0
+        for token, fontname, size, color in words:
+            try:
+                width = _text_width(token, fontname, size)
+            except Exception:
+                width = len(token) * size * 0.5
+            if token.strip() == "":
+                if current:
+                    current.append((token, fontname, size, color))
+                    current_w += width
+                continue
+            if current and current_w + width > max_width:
+                lines.append(current)
+                current = [(token, fontname, size, color)]
+                current_w = width
+            else:
+                current.append((token, fontname, size, color))
+                current_w += width
+        if current:
+            lines.append(current)
+        return lines
+
+    def draw_lines(self, lines, x0: float, max_width: float, alignment) -> float:
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        height = 0.0
+        for line in lines:
+            line_h = max((size for _t, _f, size, _c in line), default=self.base_size) * 1.28
+            line_w = 0.0
+            for token, fontname, size, _c in line:
+                try:
+                    line_w += _text_width(token, fontname, size)
+                except Exception:
+                    line_w += len(token) * size * 0.5
+            if alignment == WD_ALIGN_PARAGRAPH.CENTER:
+                start_x = x0 + max(0.0, (max_width - line_w) / 2)
+            elif alignment == WD_ALIGN_PARAGRAPH.RIGHT:
+                start_x = x0 + max(0.0, max_width - line_w)
+            else:
+                start_x = x0
+            x = start_x
+            baseline = self.y + line_h * 0.82
+            for token, fontname, size, color in line:
+                if token.strip():
+                    try:
+                        self.page.insert_text(
+                            (x, baseline), token, fontname=fontname,
+                            fontsize=size, color=color,
+                        )
+                    except Exception:
+                        self.page.insert_text(
+                            (x, baseline), token, fontname="helv",
+                            fontsize=size, color=color,
+                        )
+                try:
+                    x += _text_width(token, fontname, size)
+                except Exception:
+                    x += len(token) * size * 0.5
+            self.y += line_h
+            height += line_h
+        return height
+
+    def render_paragraph(self, paragraph):
+        text = paragraph.text or ""
+        # Embedded images in this paragraph.
+        self.render_paragraph_images(paragraph)
+        if not text.strip():
+            self.y += self.base_size * 0.6
+            return
+        try:
+            space_before = paragraph.paragraph_format.space_before
+            space_after = paragraph.paragraph_format.space_after
+            if space_before:
+                self.y += float(space_before.pt)
+        except Exception:
+            space_after = None
+        try:
+            style_name = paragraph.style.name if paragraph.style else ""
+        except Exception:
+            style_name = ""
+        heading_sizes = {"Heading 1": 16.0, "Heading 2": 13.5, "Heading 3": 11.5, "Title": 22.0}
+        if style_name in heading_sizes:
+            from docx.shared import Pt
+
+            for run in paragraph.runs:
+                if run.font.size is None:
+                    run.font.size = Pt(heading_sizes[style_name])
+                if run.bold is None:
+                    run.bold = True
+        runs = list(paragraph.runs) or [paragraph]
+        if not paragraph.runs:
+            # Fallback shim object with .text
+            class _R:
+                text = paragraph.text
+                bold = italic = None
+                font = type("F", (), {"size": None, "name": None, "color": type("C", (), {"rgb": None})()})()
+                style = None
+            runs = [_R()]
+        lines = self.wrap_runs(runs, self.content_w)
+        line_h_est = max(
+            (size for line in lines for _t, _f, size, _c in line),
+            default=self.base_size,
+        ) * 1.28
+        self.ensure_space(min(line_h_est, 40.0))
+        self.draw_lines(lines, self.margin_l, self.content_w, paragraph.alignment)
+        try:
+            if space_after:
+                self.y += float(space_after.pt)
+            else:
+                self.y += 2.0
+        except Exception:
+            self.y += 2.0
+
+    def render_paragraph_images(self, paragraph):
+        from docx.oxml.ns import qn
+
+        for blip in paragraph._p.findall(f".//{qn('a:blip')}"):
+            embed = blip.get(qn("r:embed"))
+            if not embed:
+                continue
+            try:
+                part = self.document.part.related_parts[embed]
+                image_bytes = part.blob
+            except Exception:
+                continue
+            # Image display size if specified.
+            width = self.content_w
+            extents = paragraph._p.findall(f".//{qn('wp:extent')}")
+            if extents:
+                try:
+                    cx = int(extents[0].get("cx") or 0)
+                    if cx:
+                        width = min(self.content_w, cx / 12700.0)
+                except Exception:
+                    pass
+            stream = fitz.open("png", image_bytes) if image_bytes[:4] == b"\x89PNG" else None
+            try:
+                if stream is not None:
+                    src_page = stream[0]
+                    ratio = src_page.rect.height / max(src_page.rect.width, 1)
+                else:
+                    pix_doc = fitz.open(stream=image_bytes)
+                    src_page = pix_doc[0]
+                    ratio = src_page.rect.height / max(src_page.rect.width, 1)
+            except Exception:
+                ratio = 0.75
+            height = width * ratio
+            if height > self.page_h - self.margin_t - self.margin_b:
+                height = self.page_h - self.margin_t - self.margin_b
+                width = height / max(ratio, 0.01)
+            self.ensure_space(height)
+            try:
+                self.page.insert_image(
+                    fitz.Rect(self.margin_l, self.y, self.margin_l + width, self.y + height),
+                    stream=image_bytes,
+                )
+            except Exception:
+                continue
+            self.y += height + 4
+
+    def column_widths(self, table) -> list[float]:
+        widths = []
+        for column in table.columns:
+            try:
+                widths.append(float(column.width.pt) if column.width else 0.0)
+            except Exception:
+                widths.append(0.0)
+        if not widths:
+            return [self.content_w]
+        total = sum(widths)
+        if total <= 0:
+            return [self.content_w / len(widths)] * len(widths)
+        # Normalise to the available page width.
+        return [w * self.content_w / total for w in widths]
+
+    def cell_shading(self, cell):
+        from docx.oxml.ns import qn
+
+        try:
+            tc_pr = cell._tc.get_or_add_tcPr()
+            shd = tc_pr.find(qn("w:shd"))
+            if shd is not None:
+                fill = shd.get(qn("w:fill"))
+                if fill and fill.lower() not in {"auto", "none"}:
+                    r = int(fill[0:2], 16) / 255
+                    g = int(fill[2:4], 16) / 255
+                    b = int(fill[4:6], 16) / 255
+                    return (r, g, b)
+        except Exception:
+            pass
+        return None
+
+    def render_table(self, table):
+        if not table.rows:
+            return
+        widths = self.column_widths(table)
+        col_x = [self.margin_l]
+        for w in widths:
+            col_x.append(col_x[-1] + w)
+
+        for row in table.rows:
+            cells_data = []
+            row_h = 8.0
+            for idx, cell in enumerate(row.cells):
+                max_w = max(30.0, widths[idx] - 7.0)
+                cell_lines = []
+                for paragraph in cell.paragraphs:
+                    if paragraph.runs:
+                        cell_lines.extend(self.wrap_runs(list(paragraph.runs), max_w))
+                    elif paragraph.text:
+                        class _R2:
+                            text = paragraph.text
+                            bold = italic = None
+                            font = type("F", (), {"size": None, "name": None, "color": type("C", (), {"rgb": None})()})()
+                            style = None
+                        cell_lines.extend(self.wrap_runs([_R2()], max_w))
+                cell_h = 5.0
+                for line in cell_lines:
+                    cell_h += max((s for _t, _f, s, _c in line), default=9.0) * 1.28
+                cells_data.append(cell_lines)
+                row_h = max(row_h, cell_h)
+            self.ensure_space(row_h)
+            top = self.y
+            for idx, cell in enumerate(row.cells):
+                rect = fitz.Rect(col_x[idx], top, col_x[idx + 1], top + row_h)
+                shading = self.cell_shading(cell)
+                if shading:
+                    self.page.draw_rect(rect, color=(0.75, 0.78, 0.82), fill=shading, width=0.4)
+                else:
+                    self.page.draw_rect(rect, color=(0.75, 0.78, 0.82), width=0.4)
+                saved_y = self.y
+                self.y = top + 2.5
+                # Cell text, left aligned inside the cell.
+                for line in cells_data[idx]:
+                    line_h = max((s for _t, _f, s, _c in line), default=9.0) * 1.28
+                    x = col_x[idx] + 3.5
+                    baseline = self.y + line_h * 0.82
+                    for token, fontname, size, color in line:
+                        if token.strip():
+                            try:
+                                self.page.insert_text(
+                                    (x, baseline), token, fontname=fontname,
+                                    fontsize=min(size, 10.0), color=color,
+                                )
+                            except Exception:
+                                self.page.insert_text(
+                                    (x, baseline), token, fontname="helv",
+                                    fontsize=min(size, 10.0), color=color,
+                                )
+                        x += _text_width(token, fontname, min(size, 10.0))
+                    self.y += line_h
+                self.y = saved_y
+            self.y = top + row_h
+        self.y += 4.0
+
+    def render(self, dest: Path):
+        from docx.oxml.ns import qn
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+
+        body = self.document.element.body
+        for child in body.iterchildren():
+            if child.tag == qn("w:p"):
+                self.render_paragraph(Paragraph(child, self.document))
+            elif child.tag == qn("w:tbl"):
+                self.render_table(Table(child, self.document))
+        # Headings style sizes: python-docx runs already carry explicit sizes
+        # in most generated files; keep as-is.
+        self.pdf.save(str(dest), garbage=4, deflate=True)
+        self.pdf.close()
+
+
+def docx_to_pdf_builtin(source: Path, dest: Path) -> None:
+    """Render .docx to PDF in pure Python (no Word / LibreOffice needed)."""
+    from docx import Document
+
+    document = Document(str(source))
+    renderer = _DocxPdfRenderer(document)
+    renderer.render(dest)
+
+
 def word_to_pdf(source: Path, dest: Path) -> None:
+    if source.suffix.lower() == ".docx":
+        try:
+            docx_to_pdf_builtin(source, dest)
+            if dest.exists() and dest.stat().st_size > 0:
+                return
+        except Exception:
+            pass
+
     try:
         from docx2pdf import convert as docx_convert
 
@@ -1751,7 +2237,8 @@ def word_to_pdf(source: Path, dest: Path) -> None:
     soffice = find_soffice()
     if not soffice:
         raise RuntimeError(
-            "Word → PDF needs Microsoft Word (docx2pdf) or LibreOffice installed on this PC."
+            "Could not convert this Word file. Built-in conversion supports .docx files; "
+            "for old .doc files Microsoft Word or LibreOffice is still needed."
         )
 
     out_dir = dest.parent

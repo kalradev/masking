@@ -36,8 +36,6 @@ const convertDownloadAll = document.getElementById("convert-download-all");
 const convertFileResults = document.getElementById("convert-file-results");
 const convertDropTitle = document.getElementById("convert-drop-title");
 const convertDropHint = document.getElementById("convert-drop-hint");
-const convertHint = document.getElementById("convert-hint");
-
 let convertFiles = [];
 
 const FORMAT_HINTS = {
@@ -45,12 +43,6 @@ const FORMAT_HINTS = {
     "Airtel auto detect masks: total purchase order value, value in words, unit price, line total, CGST, SGST, total line value, and payment terms. (INR) stays visible.",
   beetal:
     "Beetal auto detect masks: unit price, delivery date, amount, rate, total amount, total value with GST, PO value in words, and payment terms.",
-};
-
-const CONVERT_HINTS = {
-  "pdf-to-word":
-    "PDF → Word creates an editable Word file. Amount / price columns are cleaned so digits stay on one line.",
-  "word-to-pdf": "Word → PDF converts your document to PDF.",
 };
 
 const MAX_FILES = 25;
@@ -604,9 +596,6 @@ function syncConvert() {
   const dir = currentConvertDir();
   convertUploadStep.classList.toggle("hidden", !dir);
   convertBtn.classList.toggle("hidden", !dir);
-  if (convertHint) {
-    convertHint.textContent = dir ? CONVERT_HINTS[dir] || "" : "";
-  }
   if (dir === "pdf-to-word") {
     convertFileInput.accept = ".pdf,application/pdf";
     convertDropTitle.textContent = "Drop PDFs here";
