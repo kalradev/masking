@@ -1843,6 +1843,54 @@ def _text_width(token: str, fontname: str, fontsize: float) -> float:
         return len(token) * fontsize * 0.5
 
 
+_FONT_DIRS = [Path(r"C:\Windows\Fonts"), Path("/usr/share/fonts"), Path("/usr/local/share/fonts")]
+_font_file_index: dict | None = None
+_FONT_ALIASES = {
+    "timesnewroman": "times",
+    "couriernew": "cour",
+    "arialmt": "arial",
+    "calibri": "calibri",
+    "cambria": "cambria",
+}
+
+
+def _get_font_file_index() -> dict:
+    global _font_file_index
+    if _font_file_index is not None:
+        return _font_file_index
+    index: dict[str, Path] = {}
+    for folder in _FONT_DIRS:
+        try:
+            if folder.exists():
+                for item in folder.iterdir():
+                    if item.suffix.lower() in {".ttf", ".otf"}:
+                        index.setdefault(item.stem.lower(), item)
+        except Exception:
+            continue
+    _font_file_index = index
+    return index
+
+
+def _resolve_font_file(font_name: str, bold: bool, italic: bool):
+    base = re.sub(r"[^a-z0-9]", "", (font_name or "").lower())
+    if not base:
+        return None
+    base = _FONT_ALIASES.get(base, base)
+    if bold and italic:
+        stems = [base + "bi", base + "z", base + "bdit", base + "bolditalic", base + "biit"]
+    elif bold:
+        stems = [base + "bd", base + "b", base + "bold", base]
+    elif italic:
+        stems = [base + "i", base + "it", base + "italic", base + "li", base]
+    else:
+        stems = [base, base + "r", base + "regular", base + "book"]
+    index = _get_font_file_index()
+    for stem in stems:
+        if stem in index:
+            return index[stem]
+    return None
+
+
 _DOCX_FONT_MAP = {
     "courier": ("cour", "cobo", "coit", "cobi"),
     "consolas": ("cour", "cobo", "coit", "cobi"),
@@ -1852,32 +1900,38 @@ _DOCX_FONT_MAP = {
 }
 
 
-def _docx_font(run, base_size: float) -> tuple[str, float]:
+def _docx_font(run, base_size: float):
+    """Return (fontname, size, fontfile-or-None) for a run."""
     name = ""
     size = base_size
     try:
         if run.font.size:
             size = float(run.font.size.pt)
         if run.font.name:
-            name = run.font.name.lower()
+            name = run.font.name
         elif run.style is not None and run.style.font.name:
-            name = run.style.font.name.lower()
+            name = run.style.font.name
     except Exception:
         pass
-    family = ("helv", "hebo", "heit", "hebi")
-    for key, fonts in _DOCX_FONT_MAP.items():
-        if key in name:
-            family = fonts
-            break
     bold = bool(run.bold)
     italic = bool(run.italic)
+    fontfile = _resolve_font_file(name, bold, italic)
+    if fontfile is not None:
+        alias = re.sub(r"[^A-Za-z0-9]", "", fontfile.stem) or "CustomFont"
+        return alias, size, fontfile
+    lowered = (name or "").lower()
+    family = ("helv", "hebo", "heit", "hebi")
+    for key, fonts in _DOCX_FONT_MAP.items():
+        if key in lowered:
+            family = fonts
+            break
     if bold and italic:
-        return family[3], size
+        return family[3], size, None
     if bold:
-        return family[1], size
+        return family[1], size, None
     if italic:
-        return family[2], size
-    return family[0], size
+        return family[2], size, None
+    return family[0], size, None
 
 
 def _docx_color(run) -> tuple[float, float, float]:
@@ -1890,10 +1944,33 @@ def _docx_color(run) -> tuple[float, float, float]:
     return (0, 0, 0)
 
 
+def _shim_run(text: str):
+    class _Shim:
+        pass
+
+    run = _Shim()
+    run.text = text
+    run.bold = None
+    run.italic = None
+    run.style = None
+
+    class _Color:
+        rgb = None
+
+    class _Font:
+        size = None
+        name = None
+        color = _Color()
+
+    run.font = _Font()
+    return run
+
+
 class _DocxPdfRenderer:
     def __init__(self, document):
         self.document = document
-        section = document.sections[0]
+        self.section = document.sections[0]
+        section = self.section
         self.page_w = float(section.page_width.pt)
         self.page_h = float(section.page_height.pt)
         self.margin_l = float(section.left_margin.pt) if section.left_margin else 36.0
@@ -1901,74 +1978,129 @@ class _DocxPdfRenderer:
         self.margin_t = float(section.top_margin.pt) if section.top_margin else 36.0
         self.margin_b = float(section.bottom_margin.pt) if section.bottom_margin else 36.0
         self.content_w = max(100.0, self.page_w - self.margin_l - self.margin_r)
-        self.base_size = 10.5
+        self.base_size = 11.0
         try:
             normal = document.styles["Normal"]
             if normal.font.size:
                 self.base_size = float(normal.font.size.pt)
+            if normal.font.name and not getattr(self, "_normal_font", None):
+                self._normal_font = normal.font.name
         except Exception:
-            pass
+            self._normal_font = None
         self.pdf = fitz.open()
         self.page = None
         self.y = self.margin_t
+        self._fonts: dict[str, object] = {}
+        self._in_hf = False
+        self._line_h_exact: float | None = None
+        self._list_counters: dict = {}
         self.new_page()
 
+    # -- fonts / measuring -------------------------------------------------
+    def _font_obj(self, fontfile):
+        key = str(fontfile)
+        if key not in self._fonts:
+            self._fonts[key] = fitz.Font(fontfile=key)
+        return self._fonts[key]
+
+    def tw(self, token: str, fontname: str, size: float, fontfile) -> float:
+        if fontfile is not None:
+            try:
+                return self._font_obj(fontfile).text_length(token, fontsize=size)
+            except Exception:
+                pass
+        return _text_width(token, fontname, size)
+
+    # -- pages ---------------------------------------------------------------
     def new_page(self):
         self.page = self.pdf.new_page(width=self.page_w, height=self.page_h)
         self.y = self.margin_t
+        if not self._in_hf:
+            self._draw_header_footer()
 
     def ensure_space(self, height: float):
         if self.y + height > self.page_h - self.margin_b and self.y > self.margin_t:
             self.new_page()
 
+    def _draw_header_footer(self):
+        try:
+            header = self.section.header
+            footer = self.section.footer
+        except Exception:
+            return
+        self._in_hf = True
+        saved_y = self.y
+        try:
+            try:
+                h_dist = float(self.section.header_distance.pt) if self.section.header_distance else 18.0
+            except Exception:
+                h_dist = 18.0
+            self.y = max(8.0, h_dist)
+            for paragraph in list(getattr(header, "paragraphs", []) or []):
+                if paragraph.text.strip():
+                    lines = self.wrap_runs(list(paragraph.runs) or [_shim_run(paragraph.text)], self.content_w)
+                    self.draw_lines(lines, self.margin_l, self.content_w, paragraph.alignment)
+            try:
+                f_dist = float(self.section.footer_distance.pt) if self.section.footer_distance else 18.0
+            except Exception:
+                f_dist = 18.0
+            self.y = self.page_h - max(14.0, f_dist) - self.base_size * 1.4
+            for paragraph in list(getattr(footer, "paragraphs", []) or []):
+                if paragraph.text.strip():
+                    lines = self.wrap_runs(list(paragraph.runs) or [_shim_run(paragraph.text)], self.content_w)
+                    self.draw_lines(lines, self.margin_l, self.content_w, paragraph.alignment)
+        except Exception:
+            pass
+        self.y = saved_y
+        self._in_hf = False
+
+    # -- text layout ---------------------------------------------------------
     def wrap_runs(self, runs, max_width: float):
-        """Split styled runs into lines of (text, fontname, size, color)."""
+        """Split styled runs into lines of (text, fontname, size, color, fontfile)."""
         words = []
         for run in runs:
             text = run.text or ""
             if not text:
                 continue
-            fontname, size = _docx_font(run, self.base_size)
+            fontname, size, fontfile = _docx_font(run, self.base_size)
             color = _docx_color(run)
             for token in re.split(r"(\s+)", text):
                 if token:
-                    words.append((token, fontname, size, color))
+                    words.append((token, fontname, size, color, fontfile))
         lines = []
         current = []
         current_w = 0.0
-        for token, fontname, size, color in words:
-            try:
-                width = _text_width(token, fontname, size)
-            except Exception:
-                width = len(token) * size * 0.5
+        for token, fontname, size, color, fontfile in words:
+            width = self.tw(token, fontname, size, fontfile)
             if token.strip() == "":
                 if current:
-                    current.append((token, fontname, size, color))
+                    current.append((token, fontname, size, color, fontfile))
                     current_w += width
                 continue
             if current and current_w + width > max_width:
                 lines.append(current)
-                current = [(token, fontname, size, color)]
+                current = [(token, fontname, size, color, fontfile)]
                 current_w = width
             else:
-                current.append((token, fontname, size, color))
+                current.append((token, fontname, size, color, fontfile))
                 current_w += width
         if current:
             lines.append(current)
         return lines
+
+    def _line_height(self, line) -> float:
+        if self._line_h_exact:
+            return float(self._line_h_exact)
+        max_size = max((size for _t, _f, size, _c, _ff in line), default=self.base_size)
+        return max_size * 1.22
 
     def draw_lines(self, lines, x0: float, max_width: float, alignment) -> float:
         from docx.enum.text import WD_ALIGN_PARAGRAPH
 
         height = 0.0
         for line in lines:
-            line_h = max((size for _t, _f, size, _c in line), default=self.base_size) * 1.28
-            line_w = 0.0
-            for token, fontname, size, _c in line:
-                try:
-                    line_w += _text_width(token, fontname, size)
-                except Exception:
-                    line_w += len(token) * size * 0.5
+            line_h = self._line_height(line)
+            line_w = sum(self.tw(t, f, s, ff) for t, f, s, _c, ff in line)
             if alignment == WD_ALIGN_PARAGRAPH.CENTER:
                 start_x = x0 + max(0.0, (max_width - line_w) / 2)
             elif alignment == WD_ALIGN_PARAGRAPH.RIGHT:
@@ -1976,41 +2108,103 @@ class _DocxPdfRenderer:
             else:
                 start_x = x0
             x = start_x
-            baseline = self.y + line_h * 0.82
-            for token, fontname, size, color in line:
+            baseline = self.y + line_h * 0.8
+            for token, fontname, size, color, fontfile in line:
                 if token.strip():
                     try:
-                        self.page.insert_text(
-                            (x, baseline), token, fontname=fontname,
-                            fontsize=size, color=color,
-                        )
+                        if fontfile is not None:
+                            self.page.insert_text(
+                                (x, baseline), token, fontname=fontname,
+                                fontfile=str(fontfile), fontsize=size, color=color,
+                            )
+                        else:
+                            self.page.insert_text(
+                                (x, baseline), token, fontname=fontname,
+                                fontsize=size, color=color,
+                            )
                     except Exception:
-                        self.page.insert_text(
-                            (x, baseline), token, fontname="helv",
-                            fontsize=size, color=color,
-                        )
-                try:
-                    x += _text_width(token, fontname, size)
-                except Exception:
-                    x += len(token) * size * 0.5
+                        try:
+                            self.page.insert_text(
+                                (x, baseline), token, fontname="helv",
+                                fontsize=size, color=color,
+                            )
+                        except Exception:
+                            pass
+                x += self.tw(token, fontname, size, fontfile)
             self.y += line_h
             height += line_h
         return height
 
+    # -- paragraphs ------------------------------------------------------------
+    def _list_prefix(self, paragraph) -> str:
+        from docx.oxml.ns import qn
+
+        try:
+            p_pr = paragraph._p.get_or_add_pPr()
+            num_pr = p_pr.find(qn("w:numPr"))
+            if num_pr is None:
+                style_name = (paragraph.style.name or "") if paragraph.style else ""
+                if "bullet" in style_name.lower() or "list" in style_name.lower():
+                    return "•  "
+                return ""
+            num_id_el = num_pr.find(qn("w:numId"))
+            ilvl_el = num_pr.find(qn("w:ilvl"))
+            num_id = int(num_id_el.get(qn("w:val"))) if num_id_el is not None else 0
+            ilvl = int(ilvl_el.get(qn("w:val"))) if ilvl_el is not None else 0
+            fmt = "bullet"
+            try:
+                numbering = self.document.part.numbering_part.element
+                abs_id = None
+                for num in numbering.findall(qn("w:num")):
+                    if int(num.get(qn("w:numId"))) == num_id:
+                        abs_el = num.find(qn("w:abstractNumId"))
+                        abs_id = int(abs_el.get(qn("w:val")))
+                        break
+                if abs_id is not None:
+                    for abs_num in numbering.findall(qn("w:abstractNum")):
+                        if int(abs_num.get(qn("w:abstractNumId"))) == abs_id:
+                            for lvl in abs_num.findall(qn("w:lvl")):
+                                if int(lvl.get(qn("w:ilvl"))) == ilvl:
+                                    fmt_el = lvl.find(qn("w:numFmt"))
+                                    if fmt_el is not None:
+                                        fmt = fmt_el.get(qn("w:val")) or "bullet"
+                                    break
+            except Exception:
+                pass
+            if fmt in {"decimal", "decimalZero"}:
+                key = (num_id, ilvl)
+                self._list_counters[key] = self._list_counters.get(key, 0) + 1
+                return f"{self._list_counters[key]}.  "
+            if fmt in {"lowerLetter", "upperLetter"}:
+                key = (num_id, ilvl)
+                self._list_counters[key] = self._list_counters.get(key, 0) + 1
+                n = self._list_counters[key]
+                letter = chr(ord("a") + (n - 1) % 26)
+                if fmt == "upperLetter":
+                    letter = letter.upper()
+                return f"{letter}.  "
+            return "•  "
+        except Exception:
+            return ""
+
     def render_paragraph(self, paragraph):
         text = paragraph.text or ""
-        # Embedded images in this paragraph.
         self.render_paragraph_images(paragraph)
+        pf = paragraph.paragraph_format
+        try:
+            if pf.page_break_before:
+                self.new_page()
+        except Exception:
+            pass
         if not text.strip():
             self.y += self.base_size * 0.6
             return
         try:
-            space_before = paragraph.paragraph_format.space_before
-            space_after = paragraph.paragraph_format.space_after
-            if space_before:
-                self.y += float(space_before.pt)
+            if pf.space_before:
+                self.y += float(pf.space_before.pt)
         except Exception:
-            space_after = None
+            pass
+
         try:
             style_name = paragraph.style.name if paragraph.style else ""
         except Exception:
@@ -2024,29 +2218,83 @@ class _DocxPdfRenderer:
                     run.font.size = Pt(heading_sizes[style_name])
                 if run.bold is None:
                     run.bold = True
-        runs = list(paragraph.runs) or [paragraph]
-        if not paragraph.runs:
-            # Fallback shim object with .text
-            class _R:
-                text = paragraph.text
-                bold = italic = None
-                font = type("F", (), {"size": None, "name": None, "color": type("C", (), {"rgb": None})()})()
-                style = None
-            runs = [_R()]
-        lines = self.wrap_runs(runs, self.content_w)
-        line_h_est = max(
-            (size for line in lines for _t, _f, size, _c in line),
-            default=self.base_size,
-        ) * 1.28
-        self.ensure_space(min(line_h_est, 40.0))
-        self.draw_lines(lines, self.margin_l, self.content_w, paragraph.alignment)
+
+        # Line spacing.
+        self._line_h_exact = None
+        line_factor_note = None
         try:
-            if space_after:
-                self.y += float(space_after.pt)
+            spacing = pf.line_spacing
+            if spacing is not None:
+                if hasattr(spacing, "pt"):
+                    self._line_h_exact = float(spacing.pt)
+                elif isinstance(spacing, (int, float)):
+                    line_factor_note = float(spacing)
+        except Exception:
+            pass
+
+        indent_left = 0.0
+        try:
+            if pf.left_indent:
+                indent_left = float(pf.left_indent.pt)
+        except Exception:
+            pass
+
+        prefix = self._list_prefix(paragraph)
+        runs = list(paragraph.runs) or [_shim_run(paragraph.text)]
+        avail = max(40.0, self.content_w - indent_left)
+        if prefix:
+            lines = self.wrap_runs(runs, avail - 16.0)
+            first_size = self.base_size
+            if lines and lines[0]:
+                first_size = lines[0][0][2]
+            self.ensure_space(self._line_height(lines[0]) if lines else first_size * 1.22)
+            bullet_y = self.y
+            try:
+                fontfile = None
+                self.page.insert_text(
+                    (self.margin_l + indent_left, bullet_y + first_size * 1.0),
+                    prefix.strip(), fontname="helv", fontsize=first_size, color=(0, 0, 0),
+                )
+            except Exception:
+                pass
+            self.draw_lines(lines, self.margin_l + indent_left + 16.0, avail - 16.0, paragraph.alignment)
+        else:
+            lines = self.wrap_runs(runs, avail)
+            if lines:
+                self.ensure_space(min(self._line_height(lines[0]), 48.0))
+            if line_factor_note and line_factor_note != 1.0 and not self._line_h_exact:
+                # Temporarily scale by re-drawing with adjusted exact heights per line.
+                saved = self._line_h_exact
+                heights = []
+                for line in lines:
+                    max_size = max((s for _t, _f, s, _c, _ff in line), default=self.base_size)
+                    heights.append(max_size * 1.22 * line_factor_note)
+                # Draw line-by-line so each keeps its spacing.
+                for line, h in zip(lines, heights):
+                    self._line_h_exact = h
+                    self.draw_lines([line], self.margin_l + indent_left, avail, paragraph.alignment)
+                self._line_h_exact = saved
+            else:
+                self.draw_lines(lines, self.margin_l + indent_left, avail, paragraph.alignment)
+        self._line_h_exact = None
+        try:
+            if pf.space_after:
+                self.y += float(pf.space_after.pt)
             else:
                 self.y += 2.0
         except Exception:
             self.y += 2.0
+
+        # Explicit page break inside the paragraph.
+        try:
+            from docx.oxml.ns import qn
+
+            for br in paragraph._p.findall(f".//{qn('w:br')}"):
+                if br.get(qn("w:type")) == "page":
+                    self.new_page()
+                    break
+        except Exception:
+            pass
 
     def render_paragraph_images(self, paragraph):
         from docx.oxml.ns import qn
@@ -2060,31 +2308,31 @@ class _DocxPdfRenderer:
                 image_bytes = part.blob
             except Exception:
                 continue
-            # Image display size if specified.
             width = self.content_w
             extents = paragraph._p.findall(f".//{qn('wp:extent')}")
+            height = None
             if extents:
                 try:
                     cx = int(extents[0].get("cx") or 0)
+                    cy = int(extents[0].get("cy") or 0)
                     if cx:
                         width = min(self.content_w, cx / 12700.0)
+                    if cx and cy:
+                        height = width * (cy / cx)
                 except Exception:
                     pass
-            stream = fitz.open("png", image_bytes) if image_bytes[:4] == b"\x89PNG" else None
-            try:
-                if stream is not None:
-                    src_page = stream[0]
-                    ratio = src_page.rect.height / max(src_page.rect.width, 1)
-                else:
-                    pix_doc = fitz.open(stream=image_bytes)
-                    src_page = pix_doc[0]
-                    ratio = src_page.rect.height / max(src_page.rect.width, 1)
-            except Exception:
-                ratio = 0.75
-            height = width * ratio
-            if height > self.page_h - self.margin_t - self.margin_b:
-                height = self.page_h - self.margin_t - self.margin_b
-                width = height / max(ratio, 0.01)
+            if height is None:
+                try:
+                    probe = fitz.open(stream=image_bytes)
+                    src = probe[0].rect
+                    ratio = src.height / max(src.width, 1)
+                except Exception:
+                    ratio = 0.75
+                height = width * ratio
+            max_h = self.page_h - self.margin_t - self.margin_b
+            if height > max_h:
+                width = width * max_h / height
+                height = max_h
             self.ensure_space(height)
             try:
                 self.page.insert_image(
@@ -2095,6 +2343,7 @@ class _DocxPdfRenderer:
                 continue
             self.y += height + 4
 
+    # -- tables ------------------------------------------------------------------
     def column_widths(self, table) -> list[float]:
         widths = []
         for column in table.columns:
@@ -2107,7 +2356,8 @@ class _DocxPdfRenderer:
         total = sum(widths)
         if total <= 0:
             return [self.content_w / len(widths)] * len(widths)
-        # Normalise to the available page width.
+        if total <= self.content_w + 1.0:
+            return widths  # keep the document's own widths
         return [w * self.content_w / total for w in widths]
 
     def cell_shading(self, cell):
@@ -2136,30 +2386,47 @@ class _DocxPdfRenderer:
             col_x.append(col_x[-1] + w)
 
         for row in table.rows:
-            cells_data = []
+            cells_data: dict[int, list] = {}
             row_h = 8.0
+            try:
+                if row.height:
+                    row_h = max(row_h, float(row.height.pt))
+            except Exception:
+                pass
+            seen: set[int] = set()
             for idx, cell in enumerate(row.cells):
-                max_w = max(30.0, widths[idx] - 7.0)
-                cell_lines = []
+                if id(cell._tc) in seen:
+                    continue
+                seen.add(id(cell._tc))
+                span = 1
+                try:
+                    span = max(1, int(cell.grid_span or 1))
+                except Exception:
+                    span = 1
+                cell_w = sum(widths[idx: idx + span]) if idx < len(widths) else widths[-1]
+                max_w = max(28.0, cell_w - 7.0)
+                aligned_lines = []
                 for paragraph in cell.paragraphs:
                     if paragraph.runs:
-                        cell_lines.extend(self.wrap_runs(list(paragraph.runs), max_w))
+                        for line in self.wrap_runs(list(paragraph.runs), max_w):
+                            aligned_lines.append((line, paragraph.alignment))
                     elif paragraph.text:
-                        class _R2:
-                            text = paragraph.text
-                            bold = italic = None
-                            font = type("F", (), {"size": None, "name": None, "color": type("C", (), {"rgb": None})()})()
-                            style = None
-                        cell_lines.extend(self.wrap_runs([_R2()], max_w))
+                        for line in self.wrap_runs([_shim_run(paragraph.text)], max_w):
+                            aligned_lines.append((line, paragraph.alignment))
                 cell_h = 5.0
-                for line in cell_lines:
-                    cell_h += max((s for _t, _f, s, _c in line), default=9.0) * 1.28
-                cells_data.append(cell_lines)
+                for line, _align in aligned_lines:
+                    cell_h += self._line_height(line)
+                cells_data[idx] = (aligned_lines, cell_w)
                 row_h = max(row_h, cell_h)
             self.ensure_space(row_h)
             top = self.y
+            seen_draw: set[int] = set()
             for idx, cell in enumerate(row.cells):
-                rect = fitz.Rect(col_x[idx], top, col_x[idx + 1], top + row_h)
+                if id(cell._tc) in seen_draw:
+                    continue
+                seen_draw.add(id(cell._tc))
+                aligned_lines, cell_w = cells_data.get(idx, ([], widths[idx] if idx < len(widths) else 60.0))
+                rect = fitz.Rect(col_x[idx], top, col_x[idx] + cell_w, top + row_h)
                 shading = self.cell_shading(cell)
                 if shading:
                     self.page.draw_rect(rect, color=(0.75, 0.78, 0.82), fill=shading, width=0.4)
@@ -2167,24 +2434,40 @@ class _DocxPdfRenderer:
                     self.page.draw_rect(rect, color=(0.75, 0.78, 0.82), width=0.4)
                 saved_y = self.y
                 self.y = top + 2.5
-                # Cell text, left aligned inside the cell.
-                for line in cells_data[idx]:
-                    line_h = max((s for _t, _f, s, _c in line), default=9.0) * 1.28
-                    x = col_x[idx] + 3.5
-                    baseline = self.y + line_h * 0.82
-                    for token, fontname, size, color in line:
+                from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+                for line, alignment in aligned_lines:
+                    line_h = self._line_height(line)
+                    line_w = sum(self.tw(t, f, s, ff) for t, f, s, _c, ff in line)
+                    if alignment == WD_ALIGN_PARAGRAPH.CENTER:
+                        x = col_x[idx] + max(3.5, (cell_w - line_w) / 2)
+                    elif alignment == WD_ALIGN_PARAGRAPH.RIGHT:
+                        x = col_x[idx] + max(3.5, cell_w - line_w - 3.5)
+                    else:
+                        x = col_x[idx] + 3.5
+                    baseline = self.y + line_h * 0.8
+                    for token, fontname, size, color, fontfile in line:
                         if token.strip():
                             try:
-                                self.page.insert_text(
-                                    (x, baseline), token, fontname=fontname,
-                                    fontsize=min(size, 10.0), color=color,
-                                )
+                                if fontfile is not None:
+                                    self.page.insert_text(
+                                        (x, baseline), token, fontname=fontname,
+                                        fontfile=str(fontfile), fontsize=size, color=color,
+                                    )
+                                else:
+                                    self.page.insert_text(
+                                        (x, baseline), token, fontname=fontname,
+                                        fontsize=size, color=color,
+                                    )
                             except Exception:
-                                self.page.insert_text(
-                                    (x, baseline), token, fontname="helv",
-                                    fontsize=min(size, 10.0), color=color,
-                                )
-                        x += _text_width(token, fontname, min(size, 10.0))
+                                try:
+                                    self.page.insert_text(
+                                        (x, baseline), token, fontname="helv",
+                                        fontsize=size, color=color,
+                                    )
+                                except Exception:
+                                    pass
+                        x += self.tw(token, fontname, size, fontfile)
                     self.y += line_h
                 self.y = saved_y
             self.y = top + row_h
@@ -2201,8 +2484,6 @@ class _DocxPdfRenderer:
                 self.render_paragraph(Paragraph(child, self.document))
             elif child.tag == qn("w:tbl"):
                 self.render_table(Table(child, self.document))
-        # Headings style sizes: python-docx runs already carry explicit sizes
-        # in most generated files; keep as-is.
         self.pdf.save(str(dest), garbage=4, deflate=True)
         self.pdf.close()
 
