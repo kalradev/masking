@@ -15,6 +15,7 @@
         <nav class="sidebar-nav">
           <button type="button" class="nav-btn active" data-page="masking">Masking</button>
           <button type="button" class="nav-btn" data-page="convert">Convert</button>
+          <button type="button" class="nav-btn" data-page="merge">Merge</button>
         </nav>
       </aside>
 
@@ -160,6 +161,47 @@
               </div>
             </div>
             <ul class="file-results" id="convert-file-results"></ul>
+          </section>
+        </div>
+
+        <div id="page-merge" class="page hidden">
+          <header class="hero">
+            <p class="eyebrow">Combine documents</p>
+            <h1>Merge</h1>
+          </header>
+
+          <section class="panel">
+            <form id="merge-form">
+              <p class="step-label">1. Upload PDFs</p>
+              <label class="dropzone" id="merge-dropzone">
+                <input type="file" id="merge-file" name="files" accept="application/pdf,.pdf" multiple hidden />
+                <strong>Drop PDF files here</strong>
+                <span>or click to choose one or more PDFs</span>
+                <em id="merge-file-name">No file selected</em>
+              </label>
+              <button type="button" id="merge-clear" class="clear-pdf hidden">Clear files</button>
+
+              <div id="merge-order-step" class="hidden">
+                <p class="step-label">2. Arrange order</p>
+                <p class="format-hint">Drag rows or use the arrows. Pages are merged in this order without changing format.</p>
+                <ul class="merge-list" id="merge-list"></ul>
+              </div>
+
+              <button type="submit" id="merge-btn" class="hidden">Merge PDFs</button>
+              <p class="status" id="merge-status"></p>
+            </form>
+          </section>
+
+          <section class="result hidden" id="merge-result">
+            <div class="result-bar">
+              <div>
+                <h2>Merged PDF</h2>
+                <p id="merge-stats"></p>
+              </div>
+              <div class="actions">
+                <a class="download" id="merge-download" href="#" download="merged.pdf">Download</a>
+              </div>
+            </div>
           </section>
         </div>
       </main>

@@ -22,6 +22,7 @@ const methodStep = document.getElementById("method-step");
 const formatHint = document.getElementById("format-hint");
 const pageMasking = document.getElementById("page-masking");
 const pageConvert = document.getElementById("page-convert");
+const pageMerge = document.getElementById("page-merge");
 const convertForm = document.getElementById("convert-form");
 const convertFileInput = document.getElementById("convert-file");
 const convertDropzone = document.getElementById("convert-dropzone");
@@ -36,7 +37,21 @@ const convertDownloadAll = document.getElementById("convert-download-all");
 const convertFileResults = document.getElementById("convert-file-results");
 const convertDropTitle = document.getElementById("convert-drop-title");
 const convertDropHint = document.getElementById("convert-drop-hint");
+const mergeForm = document.getElementById("merge-form");
+const mergeFileInput = document.getElementById("merge-file");
+const mergeDropzone = document.getElementById("merge-dropzone");
+const mergeFileName = document.getElementById("merge-file-name");
+const mergeOrderStep = document.getElementById("merge-order-step");
+const mergeList = document.getElementById("merge-list");
+const mergeBtn = document.getElementById("merge-btn");
+const mergeClear = document.getElementById("merge-clear");
+const mergeStatus = document.getElementById("merge-status");
+const mergeResult = document.getElementById("merge-result");
+const mergeStats = document.getElementById("merge-stats");
+const mergeDownload = document.getElementById("merge-download");
 let convertFiles = [];
+let mergeFiles = [];
+let mergeDragIndex = null;
 
 const FORMAT_HINTS = {
   airtel:
@@ -84,17 +99,22 @@ function syncMode() {
 }
 
 function showPage(page) {
-  const isMasking = page === "masking";
-  pageMasking.classList.toggle("hidden", !isMasking);
-  pageConvert.classList.toggle("hidden", isMasking);
+  pageMasking.classList.toggle("hidden", page !== "masking");
+  pageConvert.classList.toggle("hidden", page !== "convert");
+  pageMerge.classList.toggle("hidden", page !== "merge");
   document.querySelectorAll(".nav-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.page === page);
   });
-  if (isMasking) {
+  if (page !== "masking") {
+    clearSelectedPdf();
+  }
+  if (page !== "convert") {
     clearConvertFiles();
     convertResult.classList.add("hidden");
-  } else {
-    clearSelectedPdf();
+  }
+  if (page !== "merge") {
+    clearMergeFiles();
+    mergeResult.classList.add("hidden");
   }
 }
 
@@ -774,3 +794,210 @@ convertForm.addEventListener("submit", async (event) => {
     convertBtn.disabled = false;
   }
 });
+
+function syncMerge() {
+  const count = mergeFiles.length;
+  mergeOrderStep.classList.toggle("hidden", count < 1);
+  mergeClear.classList.toggle("hidden", count < 1);
+  mergeBtn.classList.toggle("hidden", count < 2);
+  if (count < 1) {
+    mergeFileName.textContent = "No file selected";
+    mergeBtn.textContent = "Merge PDFs";
+  } else if (count === 1) {
+    mergeFileName.textContent = "1 file selected — add at least one more";
+    mergeBtn.textContent = "Merge PDFs";
+  } else {
+    mergeFileName.textContent = `${count} files selected`;
+    mergeBtn.textContent = `Merge ${count} PDFs`;
+  }
+  renderMergeList();
+}
+
+function clearMergeFiles() {
+  mergeFiles = [];
+  mergeDragIndex = null;
+  mergeFileInput.value = "";
+  mergeList.innerHTML = "";
+  mergeStatus.textContent = "";
+  syncMerge();
+}
+
+function moveMergeFile(from, to) {
+  if (from < 0 || to < 0 || from >= mergeFiles.length || to >= mergeFiles.length || from === to) {
+    return;
+  }
+  const [item] = mergeFiles.splice(from, 1);
+  mergeFiles.splice(to, 0, item);
+  syncMerge();
+}
+
+function renderMergeList() {
+  mergeList.innerHTML = mergeFiles
+    .map(
+      (file, index) => `
+      <li class="merge-item" draggable="true" data-index="${index}">
+        <span class="merge-handle" aria-hidden="true">⋮⋮</span>
+        <span class="merge-index">${index + 1}</span>
+        <span class="merge-name" title="${file.name}">${file.name}</span>
+        <div class="merge-controls">
+          <button type="button" class="merge-up" data-index="${index}" ${index === 0 ? "disabled" : ""} title="Move up">↑</button>
+          <button type="button" class="merge-down" data-index="${index}" ${index === mergeFiles.length - 1 ? "disabled" : ""} title="Move down">↓</button>
+          <button type="button" class="merge-remove" data-index="${index}" title="Remove">✕</button>
+        </div>
+      </li>`
+    )
+    .join("");
+}
+
+function takeMergeFiles(fileList, append = true) {
+  const files = Array.from(fileList || []).filter(isPdfFile);
+  if (!files.length) {
+    if (!append || !mergeFiles.length) {
+      mergeFileInput.value = "";
+      clearMergeFiles();
+    }
+    mergeStatus.textContent = "Only PDF files are allowed.";
+    return;
+  }
+  const next = append ? mergeFiles.concat(files) : files;
+  if (next.length > MAX_FILES) {
+    mergeStatus.textContent = `Upload up to ${MAX_FILES} PDFs at once.`;
+    return;
+  }
+  mergeFiles = next;
+  mergeStatus.textContent = "";
+  mergeResult.classList.add("hidden");
+  syncMerge();
+}
+
+mergeFileInput.addEventListener("change", () => {
+  takeMergeFiles(mergeFileInput.files, true);
+  mergeFileInput.value = "";
+});
+
+mergeClear.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  clearMergeFiles();
+  mergeResult.classList.add("hidden");
+});
+
+["dragenter", "dragover"].forEach((eventName) => {
+  mergeDropzone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    mergeDropzone.classList.add("dragover");
+  });
+});
+
+["dragleave", "drop"].forEach((eventName) => {
+  mergeDropzone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    mergeDropzone.classList.remove("dragover");
+  });
+});
+
+mergeDropzone.addEventListener("drop", (event) => {
+  takeMergeFiles(event.dataTransfer.files, true);
+});
+
+mergeList.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-index]");
+  if (!button) {
+    return;
+  }
+  const index = Number(button.dataset.index);
+  if (Number.isNaN(index)) {
+    return;
+  }
+  if (button.classList.contains("merge-up")) {
+    moveMergeFile(index, index - 1);
+  } else if (button.classList.contains("merge-down")) {
+    moveMergeFile(index, index + 1);
+  } else if (button.classList.contains("merge-remove")) {
+    mergeFiles.splice(index, 1);
+    syncMerge();
+    if (!mergeFiles.length) {
+      mergeResult.classList.add("hidden");
+    }
+  }
+});
+
+mergeList.addEventListener("dragstart", (event) => {
+  const item = event.target.closest(".merge-item");
+  if (!item) {
+    return;
+  }
+  mergeDragIndex = Number(item.dataset.index);
+  item.classList.add("dragging");
+  event.dataTransfer.effectAllowed = "move";
+  try {
+    event.dataTransfer.setData("text/plain", String(mergeDragIndex));
+  } catch (_error) {
+    // Some browsers reject setData during certain drag starts; ignore.
+  }
+});
+
+mergeList.addEventListener("dragend", () => {
+  mergeDragIndex = null;
+  mergeList.querySelectorAll(".merge-item").forEach((item) => {
+    item.classList.remove("dragging", "drag-over");
+  });
+});
+
+mergeList.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  const item = event.target.closest(".merge-item");
+  if (!item) {
+    return;
+  }
+  mergeList.querySelectorAll(".merge-item").forEach((row) => {
+    row.classList.toggle("drag-over", row === item);
+  });
+});
+
+mergeList.addEventListener("drop", (event) => {
+  event.preventDefault();
+  const item = event.target.closest(".merge-item");
+  if (!item || mergeDragIndex === null) {
+    return;
+  }
+  const to = Number(item.dataset.index);
+  moveMergeFile(mergeDragIndex, to);
+  mergeDragIndex = null;
+});
+
+mergeForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (mergeFiles.length < 2) {
+    mergeStatus.textContent = "Upload at least 2 PDFs to merge.";
+    return;
+  }
+
+  mergeBtn.disabled = true;
+  mergeResult.classList.add("hidden");
+  mergeStatus.textContent = `Merging ${mergeFiles.length} PDFs...`;
+
+  try {
+    const body = new FormData();
+    mergeFiles.forEach((file) => body.append("files", file));
+    const response = await fetch("/api/merge", {
+      method: "POST",
+      body,
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || "Merge failed.");
+    }
+    mergeDownload.href = data.download_url;
+    mergeDownload.download = data.output_name || "merged.pdf";
+    mergeStats.textContent = `Merged ${data.file_count} files into ${data.page_count} pages.`;
+    mergeResult.classList.remove("hidden");
+    mergeStatus.textContent = "Done.";
+  } catch (error) {
+    mergeStatus.textContent = error.message;
+  } finally {
+    mergeBtn.disabled = false;
+  }
+});
+
+syncMerge();

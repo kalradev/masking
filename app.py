@@ -21,11 +21,15 @@ OUTPUT_DIR = BASE_DIR / "storage" / "masked"
 PAGES_DIR = BASE_DIR / "storage" / "pages"
 CONVERT_UPLOAD_DIR = BASE_DIR / "storage" / "convert_uploads"
 CONVERT_OUTPUT_DIR = BASE_DIR / "storage" / "converted"
+MERGE_UPLOAD_DIR = BASE_DIR / "storage" / "merge_uploads"
+MERGE_OUTPUT_DIR = BASE_DIR / "storage" / "merged"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 PAGES_DIR.mkdir(parents=True, exist_ok=True)
 CONVERT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 CONVERT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+MERGE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MERGE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 PAGE_ZOOM = 2.0
@@ -2658,6 +2662,83 @@ def serve_converted_zip(batch_id: str):
         mimetype="application/zip",
         as_attachment=True,
         download_name="converted.zip",
+    )
+
+
+def merge_pdfs(sources: list[Path], dest: Path) -> int:
+    """Append PDF pages in order with insert_pdf so layout/fonts stay unchanged."""
+    if len(sources) < 2:
+        raise RuntimeError("Upload at least 2 PDFs to merge.")
+    out = fitz.open()
+    try:
+        for source in sources:
+            src = fitz.open(str(source))
+            try:
+                if src.page_count < 1:
+                    raise RuntimeError(f"{source.name} has no pages.")
+                out.insert_pdf(src)
+            finally:
+                src.close()
+        if out.page_count < 1:
+            raise RuntimeError("Merged PDF has no pages.")
+        out.save(str(dest), garbage=4, deflate=True)
+        return out.page_count
+    finally:
+        out.close()
+
+
+@app.post("/api/merge")
+def api_merge():
+    uploads = request.files.getlist("files") or request.files.getlist("file")
+    uploads = [item for item in uploads if item and item.filename]
+    if len(uploads) < 2:
+        return jsonify({"error": "Upload at least 2 PDFs to merge."}), 400
+    if len(uploads) > MAX_FILES:
+        return jsonify({"error": f"Upload up to {MAX_FILES} PDFs at once."}), 400
+
+    job_id = uuid.uuid4().hex
+    source_paths: list[Path] = []
+    originals: list[str] = []
+    try:
+        for uploaded in uploads:
+            original = uploaded.filename or "document.pdf"
+            if not is_pdf_name(original):
+                return jsonify({"error": f"{original} is not a PDF."}), 400
+            source_path = MERGE_UPLOAD_DIR / f"{uuid.uuid4().hex}.pdf"
+            uploaded.save(source_path)
+            source_paths.append(source_path)
+            originals.append(original)
+
+        dest_path = MERGE_OUTPUT_DIR / f"{job_id}.pdf"
+        page_count = merge_pdfs(source_paths, dest_path)
+    except Exception as exc:
+        return jsonify({"error": f"Could not merge these PDFs: {exc}"}), 500
+
+    return jsonify(
+        {
+            "job_id": job_id,
+            "page_count": page_count,
+            "file_count": len(originals),
+            "files": originals,
+            "output_name": "merged.pdf",
+            "download_url": f"/download-merged/{job_id}?name=merged.pdf",
+        }
+    )
+
+
+@app.get("/download-merged/<job_id>")
+def serve_merged(job_id: str):
+    if not is_job_id(job_id):
+        return jsonify({"error": "Invalid file id."}), 400
+    dest_path = MERGE_OUTPUT_DIR / f"{job_id}.pdf"
+    if not dest_path.exists():
+        return jsonify({"error": "Merged file not found. Please merge again."}), 404
+    name = request.args.get("name") or "merged.pdf"
+    return send_file(
+        dest_path,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=name,
     )
 
 
